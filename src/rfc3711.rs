@@ -819,7 +819,7 @@ fn prf_n(master_key: &[u8], x: BigUint, n: usize) -> Vec<u8> {
     let mut ctr = aes_ctr::Aes128Ctr::new_var(master_key, &(x << 16).to_bytes_be())
         .expect("Correct Key Length");
 
-    output.reserve_exact(n.next_multiple_of(&16));
+    output.reserve_exact(n.next_multiple_of(16));
 
     for i in 0.. {
         let old_len = output.len();
