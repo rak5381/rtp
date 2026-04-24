@@ -1,8 +1,3 @@
-#[cfg(feature = "openssl")]
-extern crate openssl;
-#[cfg(feature = "tokio")]
-extern crate tokio;
-
 pub use crate::error::{Error, ErrorKind};
 
 pub mod io;

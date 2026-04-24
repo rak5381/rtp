@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Waker;
 
 use crate::rfc3711::{
     AuthenticationAlgorithm, Context as SrtpContext, EncryptionAlgorithm, Srtcp, Srtp,
@@ -39,7 +40,7 @@ impl SrtpProtectionProfile {
         cipher: EncryptionAlgorithm::AesCm,
         cipher_key_length: 128,
         cipher_salt_length: 112,
-        maximum_lifetime: 2 ^ 31,
+        maximum_lifetime: 1u32 << 31,
         auth_function: AuthenticationAlgorithm::HmacSha1,
         auth_key_length: 160,
         auth_salt_length: 80,
@@ -72,6 +73,8 @@ pub struct DtlsSrtpMuxer<S> {
     inner: S,
     dtls_buf: VecDeque<Vec<u8>>,
     srtp_buf: VecDeque<Vec<u8>>,
+    dtls_waker: Option<Waker>,
+    srtp_waker: Option<Waker>,
 }
 
 impl<S: AsyncRead + AsyncWrite> DtlsSrtpMuxer<S> {
@@ -80,6 +83,8 @@ impl<S: AsyncRead + AsyncWrite> DtlsSrtpMuxer<S> {
             inner,
             dtls_buf: VecDeque::new(),
             srtp_buf: VecDeque::new(),
+            dtls_waker: None,
+            srtp_waker: None,
         }
     }
 }
@@ -93,6 +98,23 @@ impl<S> DtlsSrtpMuxer<S> {
         };
         let srtp = DtlsSrtpMuxerPart { muxer, srtp: true };
         (dtls, srtp)
+    }
+}
+
+impl<S> DtlsSrtpMuxer<S> {
+    fn register_reader_waker(&mut self, want_srtp: bool, waker: &Waker) {
+        let slot = if want_srtp { &mut self.srtp_waker } else { &mut self.dtls_waker };
+        match slot {
+            Some(existing) if existing.will_wake(waker) => {}
+            _ => *slot = Some(waker.clone()),
+        }
+    }
+
+    fn wake_reader(&mut self, want_srtp: bool) {
+        let slot = if want_srtp { &mut self.srtp_waker } else { &mut self.dtls_waker };
+        if let Some(waker) = slot.take() {
+            waker.wake();
+        }
     }
 }
 
@@ -114,6 +136,8 @@ impl<S: AsyncRead + Unpin> DtlsSrtpMuxer<S> {
             }
         }
 
+        self.register_reader_waker(want_srtp, cx.waker());
+
         let mut buf = [0u8; 2048];
         let len = ready!(Pin::new(&mut self.inner).poll_read(cx, &mut buf))?;
         if len == 0 {
@@ -131,13 +155,14 @@ impl<S: AsyncRead + Unpin> DtlsSrtpMuxer<S> {
                 &mut self.dtls_buf
             }
             .push_back(buf.to_vec());
+            self.wake_reader(is_srtp);
             // We have to make sure we're not waiting for, e.g., a srtp packet when
             // we just got a dtls packet and the remote is waiting on a reply to it.
             // So, to prevent this kind of deadlock, we abort the current read-path
             // by pretending that we're doing non-blocking io (even if we aren't)
             // to get back to where we can enter the other (in the example: the dtls)
             // read-path and process the packet we just read.
-            Poll::Pending // FIXME this doesn't see sound, shouldn't we store the waker!?
+            Poll::Pending
         }
     }
 }
@@ -165,14 +190,14 @@ where
     S: AsyncWrite + Unpin,
 {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.muxer.lock().unwrap().inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         Pin::new(&mut self.muxer.lock().unwrap().inner).poll_flush(cx)
     }
 
@@ -258,6 +283,9 @@ where
     }
 
     fn process_incoming_srtp_packet(&mut self, buf: &[u8]) -> Option<Vec<u8>> {
+        if buf.len() < 2 {
+            return None;
+        }
         // Demux SRTP and SRTCP packets as per https://tools.ietf.org/html/rfc5761#section-4
         let payload_type = buf[1] & 0x7f;
         if 64 <= payload_type && payload_type <= 95 {
@@ -268,6 +296,9 @@ where
     }
 
     fn process_outgoing_srtp_packet(&mut self, buf: &[u8]) -> Option<Vec<u8>> {
+        if buf.len() < 2 {
+            return None;
+        }
         // Demux SRTP and SRTCP packets as per https://tools.ietf.org/html/rfc5761#section-4
         let payload_type = buf[1] & 0x7f;
         if 64 <= payload_type && payload_type <= 95 {
